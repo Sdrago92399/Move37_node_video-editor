@@ -4,7 +4,6 @@ const Queue = require("bull");
 const ffmpeg = require("fluent-ffmpeg");
 const Video = require("../models/sequelize").models["Video"];
 
-const parseBool = (bool) => bool=='true';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const renderQueue = new Queue("render", {
@@ -25,7 +24,7 @@ renderQueue.process(async (job) => {
       console.warn(`Video with ID ${videoId} not found. Render job interrupted`);
     }
 
-    if (!parseBool(video.isPublic) && video.userId !== userId) {
+    if (!video.isPublic && video.userId !== userId) {
       throw new Error("This is a private video and you don't have access.");
     }
 
