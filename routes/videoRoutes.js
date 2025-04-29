@@ -12,7 +12,7 @@ const { verifyToken } = require("../middleware/authMiddleware");
 
 const router = express.Router();
 
-router.post("/upload", upload.single("video"), verifyToken, uploadVideo);
+router.post("/upload", verifyToken, upload.single("video"), uploadVideo);
 router.post("/:id/trim", verifyToken, trimVideo);
 router.post("/:id/subtitles", verifyToken, addSubtitles);
 router.post("/:id/render", verifyToken, renderVideo);

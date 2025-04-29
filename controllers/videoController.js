@@ -21,6 +21,13 @@ const isOwner = (userId, video) => {
 
 const parseBool = (bool) => bool=='true';
 
+// Helper to delete a file (log errors but don't throw)
+const safeUnlink = (filePath) => {
+  fs.unlink(filePath, (err) => {
+    if (err) console.warn(`Failed to delete file ${filePath}:`, err);
+  });
+};
+
 const getVideoMetadata = (path) => {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(path, (err, metadata) => {
@@ -42,23 +49,29 @@ exports.uploadVideo = async (req, res) => {
       return res.status(401).json({ message: "You need to login to make the video private" });
     }
 
-    const fileExtension = path.extname(video.originalname); // e.g., ".mp4"
-    const correctFilePath = path.join(__dirname, "../uploads", `${video.filename}${fileExtension}`);
-
-    fs.rename(video.path, correctFilePath, (err) => {
-      if (err) throw new Error("Failed to rename the uploaded file.");
-    });
-
-    const videoMeta = await getVideoMetadata(correctFilePath);
-
+    // Metadata + create placeholder record
+    const tempPath = req.file.path;
+    const extension = path.extname(req.file.originalname);
+    const meta = await getVideoMetadata(tempPath);
+    
     const newVideo = await Video.create({
-      name: video.originalname,
-      path: correctFilePath,
-      size: video.size,
+      name: null,
+      path: null,
+      size: req.file.size,
+      duration: meta.duration,
       userId: req.user?.id,
-      duration: videoMeta.duration,
       isPublic,
+      status: 'uploaded',
     });
+
+    // Finalize file naming: use video.id to avoid long names
+    const finalName = `${newVideo.id}${extension}`;
+    const finalPath = path.join(__dirname, '../uploads', finalName);
+    fs.renameSync(tempPath, finalPath);
+
+    newVideo.name = finalName;
+    newVideo.path = finalPath;
+    await newVideo.save();
 
     return res.status(201).json({ message: "Video uploaded", video: newVideo });
   } catch (err) {
@@ -72,18 +85,26 @@ exports.trimVideo = async (req, res) => {
 
   const video = await Video.findByPk(id);
 
+  if (!video) return res.status(404).json({ message: 'Not found' });
   if (!isOwner(req.user?.id, video)) return res.status(403).json({ message: "You are not authorised to perform this action" });
   
-  const trimmedPath = video.path.replace(/(\.\w+)$/, `_trimmed$1`);
+  const oldPath = video.path;
+  const ext = path.extname(oldPath);
+  const trimmedName = `${video.id}_trimmed${ext}`;
+  const trimmedPath = path.join(path.dirname(oldPath), trimmedName);
 
-  ffmpeg(video.path)
+  ffmpeg(oldPath)
     .setStartTime(start)
     .setDuration(end - start)
     .output(trimmedPath)
-    .on("end", async () => {
+    .on('end', async () => {
       video.path = trimmedPath;
-      video.status = "trimmed";
+      video.status = 'trimmed';
       await video.save();
+
+      // Delete old version
+      safeUnlink(oldPath);
+
       res.json({ message: "Trimmed video saved", video });
     })
     .on("error", (err) => res.status(500).json({ error: err.message }))
@@ -95,23 +116,30 @@ exports.addSubtitles = async (req, res) => {
   const { text, start, end } = req.body;
 
   const video = await Video.findByPk(id);
-  
+
+  if (!video) return res.status(404).json({ message: 'Not found' });
   if (!isOwner(req.user?.id, video)) return res.status(403).json({ message: "You are not authorised to perform this action" });
-  
-  const subtitlePath = video.path.replace(/(\.\w+)$/, `_subtitled$1`);
 
-  const drawText = `drawtext=text='${text}':enable='between(t,${start},${end})':x=(W-w)/2:y=H-th-10:fontsize=24:fontcolor=white:box=1:boxcolor=black`;
+  const oldPath = video.path;
+  const ext = path.extname(oldPath);
+  const subtitledName = `${video.id}_subtitled${ext}`;
+  const subtitlePath = path.join(path.dirname(oldPath), subtitledName);
+  const drawText = `drawtext=text='${text}':enable='between(t,${start},${end})':x=(W-tw)/2:y=H-th-10:fontsize=24:fontcolor=white:box=1:boxborderw=5:boxcolor=black`;
 
-  ffmpeg(video.path)
+  ffmpeg(oldPath)
     .videoFilter(drawText)
     .output(subtitlePath)
-    .on("end", async () => {
+    .on('end', async () => {
       video.path = subtitlePath;
-      video.status = "subtitle_added";
+      video.status = 'subtitle_added';
       await video.save();
-      res.json({ message: "Subtitles added", video });
+
+      // Delete old version
+      safeUnlink(oldPath);
+
+      res.json({ message: 'Subtitles added', video });
     })
-    .on("error", (err) => res.status(500).json({ error: err.message }))
+    .on('error', (err) => res.status(500).json({ error: err.message }))
     .run();
 };
 
@@ -132,6 +160,7 @@ exports.downloadVideo = async (req, res) => {
   const { id } = req.params;
   const video = await Video.findByPk(id);
 
+  if (!video) return res.status(404).json({ message: 'Not found' });
   if (video.isPublic === false && video.userId !== req.user?.id) {
      return res.status(403).json({ message: "You are not authorised to perform this action" });
   }
