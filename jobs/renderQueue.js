@@ -5,6 +5,7 @@ const ffmpeg = require("fluent-ffmpeg");
 const Video = require("../models/sequelize").models["Video"];
 
 const parseBool = (bool) => bool=='true';
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const renderQueue = new Queue("render", {
   redis: {
@@ -30,6 +31,9 @@ renderQueue.process(async (job) => {
 
     const finalPath = video.path.replace(/(\.\w+)$/, `_final$1`);
     
+    console.log(`Simulating 5sec processing time for job ${job.id}...`);
+    await sleep(5000);
+
     return new Promise((resolve, reject) => {
       ffmpeg(video.path)
         .output(finalPath)
