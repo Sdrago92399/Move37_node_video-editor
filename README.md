@@ -156,9 +156,11 @@ authorization: (required for private videos) <token without "Bearer">
 
 Body:
 {
-  "text": "Hello World",
-  "start": 5,
-  "end": 10
+  "subtitles": [
+    { "text": "Hello Move37!", "start": 0, "end": 3 },
+    { "text": "Welcome to the video", "start": 4, "end": 6 },
+    { "text": "Enjoy watching!", "start": 7, "end": 10 }
+  ]
 }
 ```
 
