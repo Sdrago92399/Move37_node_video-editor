@@ -53,7 +53,7 @@ exports.uploadVideo = async (req, res) => {
     const tempPath = req.file.path;
     const extension = path.extname(req.file.originalname);
     const meta = await getVideoMetadata(tempPath);
-    
+
     const newVideo = await Video.create({
       name: null,
       path: null,
@@ -113,36 +113,39 @@ exports.trimVideo = async (req, res) => {
 
 exports.addSubtitles = async (req, res) => {
   const { id } = req.params;
-  const { text, start, end } = req.body;
+  const { subtitles } = req.body;
 
   const video = await Video.findByPk(id);
 
-  if (!video) return res.status(404).json({ message: 'Not found' });
-  if (!isOwner(req.user?.id, video)) return res.status(403).json({ message: "You are not authorised to perform this action" });
+  if (!video) return res.status(404).json({ message: "Not found" });
+  if (!isOwner(req.user?.id, video))
+    return res.status(403).json({ message: "You are not authorised to perform this action" });
 
   const oldPath = video.path;
   const ext = path.extname(oldPath);
   const subtitledName = `${video.id}_subtitled${ext}`;
   const subtitlePath = path.join(path.dirname(oldPath), subtitledName);
-  const drawText = `drawtext=text='${text}':enable='between(t,${start},${end})':x=(W-tw)/2:y=H-th-10:fontsize=24:fontcolor=white:box=1:boxborderw=5:boxcolor=black`;
+
+  const drawtext = subtitles.map(({ text, start, end }) => {
+    return `drawtext=text='${text}':enable='between(t,${start},${end})':x=(W-tw)/2:y=H-th-10:fontsize=24:fontcolor=white:box=1:boxborderw=5:boxcolor=black`;
+  });
 
   ffmpeg(oldPath)
-    .videoFilter(drawText)
+    .videoFilter(drawtext.join(","))
     .output(subtitlePath)
-    .on('end', async () => {
+    .on("end", async () => {
       video.path = subtitlePath;
-      video.status = 'subtitle_added';
+      video.status = "subtitle_added";
       await video.save();
 
       // Delete old version
       safeUnlink(oldPath);
 
-      res.json({ message: 'Subtitles added', video });
+      res.json({ message: "Subtitles added", video });
     })
-    .on('error', (err) => res.status(500).json({ error: err.message }))
+    .on("error", (err) => res.status(500).json({ error: err.message }))
     .run();
 };
-
 exports.renderVideo = async (req, res) => {
   const { id } = req.params;
 
