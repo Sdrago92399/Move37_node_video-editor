@@ -1,10 +1,11 @@
 require('dotenv').config();
 
-const Queue = require("bull");
-const ffmpeg = require("fluent-ffmpeg");
-const Video = require("../models/sequelize").models["Video"];
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const fs       = require('fs');
+const Queue    = require("bull");
+const path     = require('path');
+const ffmpeg   = require('fluent-ffmpeg');
+const { Op }   = require('sequelize');
+const Video    = require('../models/sequelize').models.Video;
 
 const renderQueue = new Queue("render", {
   redis: {
@@ -14,54 +15,77 @@ const renderQueue = new Queue("render", {
     },
 });
 
-renderQueue.process(async (job) => {
-  try {
+// helper to delete files without throwing
+const safeUnlink = fp => fs.unlink(fp, err => err && console.warn(`unlink failed: ${fp}`, err));
 
-    const { videoId, userId } = job.data;
-    const video = await Video.findByPk(videoId);
+const sleep = ms => new Promise(res => setTimeout(res, ms));
 
-    if (!video) {
-      console.warn(`Video with ID ${videoId} not found. Render job interrupted`);
-    }
+ffmpeg.setFfprobePath(process.env.FFPROBE_LOCATION_ON_DISK);
 
-    if (!video.isPublic && video.userId !== userId) {
-      throw new Error("This is a private video and you don't have access.");
-    }
+renderQueue.process(async job => {
+  const { projectId, userId } = job.data;
 
-    const finalPath = video.path.replace(/(\.\w+)$/, `_final$1`);
-    
-    console.log(`Simulating 5sec processing time for job ${job.id}...`);
-    await sleep(5000);
+  const video = await Video.findOne({
+    where: { projectId, isCurrent: true }
+  });
 
-    return new Promise((resolve, reject) => {
-      ffmpeg(video.path)
-        .output(finalPath)
-        .on("start", (commandLine) => {
-          console.log(`FFmpeg process started for job ${job.id}`);
-        })
-        .on("end", async () => {
-          console.log(`FFmpeg processing completed for videoId ${videoId}. Updating database...`);
-          try {
-            video.finalPath = finalPath;
-            video.status = "rendered";
-            await video.save();
-            resolve();
-          } catch (err) {
-            console.error(`Failed to update database for videoId ${videoId}:`, err);
-            reject(err);
-          }
-        })
-        .on("error", (err) => {
-          console.error(`FFmpeg error for job ${job.id}:`, err);
-          reject(err);
-        })
-        .run();
-    });
-  } catch (err) {
-    console.error(`Error processing job ${job.id}:`, err);
-    throw err; // Re-throw the error to handle it upstream if needed
+  if (!video) {
+    console.warn(`Render job ${job.id}: no current version for project ${projectId}`);
+    return Promise.reject(new Error('Video not found'));
   }
-});
 
+  if (!video.isPublic && video.userId !== userId) {
+    const err = new Error("Access denied to private video");
+    console.error(`Render job ${job.id}:`, err.message);
+    return Promise.reject(err);
+  }
+
+  const ext       = path.extname(video.path);
+  const finalName = `${video.projectId}_final${ext}`;
+  const finalPath = path.join(path.dirname(video.path), finalName);
+
+  // simulate any pre-processing delay
+  console.log(`Render job ${job.id}: waiting before FFmpeg…`);
+  await sleep(5000);
+
+  return new Promise((resolve, reject) => {
+    ffmpeg(video.path)
+      .output(finalPath)
+      .on('start', cmd => {
+        console.log(`Render job ${job.id} FFmpeg start:`, cmd);
+      })
+      .on('end', async () => {
+        try {
+          // update this version to be final
+          video.finalPath = finalPath;
+          video.status    = 'rendered';
+          await video.save();
+
+          // remove all other versions in this project
+          const others = await Video.findAll({
+            where: {
+              projectId,
+              id: { [Op.ne]: video.id }
+            }
+          });
+          for (const v of others) {
+            safeUnlink(v.path);
+            await v.destroy();
+          }
+
+          console.log(`Render job ${job.id}: completed and pruned old versions.`);
+          resolve();
+        } catch (dbErr) {
+          console.error(`Render job ${job.id} DB update failed:`, dbErr);
+          reject(dbErr);
+        }
+      })
+      .on('error', err => {
+        console.error(`Render job ${job.id} FFmpeg error:`, err);
+        reject(err);
+      })
+      .run();
+  });
+});
 
 module.exports = renderQueue;

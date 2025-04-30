@@ -1,174 +1,220 @@
 require('dotenv').config();
-
-const fs = require('fs');
-const ffmpeg = require("fluent-ffmpeg");
-const path = require("path");
-const Video = require("../models/sequelize").models["Video"];
-const renderQueue = require("../jobs/renderQueue");
+const fs       = require('fs');
+const ffmpeg   = require('fluent-ffmpeg');
+const path     = require('path');
+const { Op }   = require('sequelize');
+const Video    = require('../models/sequelize').models.Video;
+const renderQueue = require('../jobs/renderQueue');
 
 ffmpeg.setFfprobePath(process.env.FFPROBE_LOCATION_ON_DISK);
 
-const isOwner = (userId, video) => {
-  // public ownership
-  if (!video.userId) return true;
+// Helpers
+const isOwner    = (userId, v) => !v.userId || v.userId === userId;
+const safeUnlink = fp => fs.unlink(fp, err => err && console.warn(`unlink failed: ${fp}`, err));  // fs.unlink() callback form :contentReference[oaicite:2]{index=2}
+const getMeta    = fp => new Promise((res, rej) =>
+  ffmpeg.ffprobe(fp, (err, md) => err ? rej(err) : res({ duration: md.format.duration }))
+);
 
-  // private ownership
-  if (video.userId == userId) return true;
-
-  // invalid owner
-  return false;
+// Remove all downstream versions
+async function pruneFuture(v) {
+  if (!v.nextVersionId) return;
+  const nxt = await Video.findByPk(v.nextVersionId);
+  if (nxt) {
+    await pruneFuture(nxt);
+    safeUnlink(nxt.path);
+    await nxt.destroy();
+  }
+  await v.update({ nextVersionId: null });
 }
 
-const parseBool = (bool) => bool=='true';
-
-// Helper to delete a file (log errors but don't throw)
-const safeUnlink = (filePath) => {
-  fs.unlink(filePath, (err) => {
-    if (err) console.warn(`Failed to delete file ${filePath}:`, err);
+// Create a new version record
+async function createVersion(oldV, tmpPath, newStatus) {
+  const nextV = await Video.create({
+    projectId: oldV.projectId,
+    version:   oldV.version + 1,
+    size:      oldV.size,
+    duration:  oldV.duration,
+    userId:    oldV.userId,
+    isPublic:  oldV.isPublic,
+    status:    newStatus,
+    previousVersionId: oldV.id,
+    nextVersionId:     null,
+    isCurrent: true,
   });
-};
 
-const getVideoMetadata = (path) => {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(path, (err, metadata) => {
-      if (err) return reject(err);
-      resolve({ duration: metadata.format.duration });
-    });
-  });
-};
+  // Rename file using nextV.id (unique) and version
+  const ext      = path.extname(tmpPath);
+  const filename = `${nextV.id}_v${nextV.version}${ext}`;
+  const final    = path.join(path.dirname(oldV.path), filename);
+  fs.renameSync(tmpPath, final);
+  await nextV.update({ name: filename, path: final });
 
+  // Link the chain
+  await oldV.update({ isCurrent: false, nextVersionId: nextV.id });
+  return nextV;
+}
+
+
+// Upload
 exports.uploadVideo = async (req, res) => {
   try {
-    const video = req.file;
-    const { isPublic: rawIsPublic } = req.body || {};
-    const isPublic = (rawIsPublic == null)? 
-      true : 
-      parseBool(rawIsPublic);
+    const isPublic = req.body.isPublic != null
+      ? req.body.isPublic === 'true'
+      : true;
+    if (!isPublic && !req.user?.id)
+      return res.status(401).json({ message: 'Login required', video: null });
 
-    if (!isPublic && !req.user?.id) {
-      return res.status(401).json({ message: "You need to login to make the video private" });
-    }
+    const tmp = req.file.path;
+    const ext = path.extname(req.file.originalname);
+    const meta = await getMeta(tmp);
 
-    // Metadata + create placeholder record
-    const tempPath = req.file.path;
-    const extension = path.extname(req.file.originalname);
-    const meta = await getVideoMetadata(tempPath);
-
-    const newVideo = await Video.create({
-      name: null,
-      path: null,
-      size: req.file.size,
+    // create initial record (version 1)
+    const video = await Video.create({
+      // id auto-generated (UUID)
+      version: 1,
+      size:    req.file.size,
       duration: meta.duration,
-      userId: req.user?.id,
+      userId:  req.user?.id,
       isPublic,
-      status: 'uploaded',
+      status:  'uploaded',
+      previousVersionId: null,
+      nextVersionId:     null,
+      isCurrent: true,
     });
 
-    // Finalize file naming: use video.id to avoid long names
-    const finalName = `${newVideo.id}${extension}`;
-    const finalPath = path.join(__dirname, '../uploads', finalName);
-    fs.renameSync(tempPath, finalPath);
+    // finalize file
+    const filename = `${video.id}_v1${ext}`;
+    const finalPath = path.join(__dirname, '../uploads', filename);
+    fs.renameSync(tmp, finalPath);
 
-    newVideo.name = finalName;
-    newVideo.path = finalPath;
-    await newVideo.save();
-
-    return res.status(201).json({ message: "Video uploaded", video: newVideo });
+    await video.update({ name: filename, path: finalPath });
+    res.status(201).json({ message: 'Video uploaded', video });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ message: err.message, video: null });
   }
 };
 
+// Trim
 exports.trimVideo = async (req, res) => {
-  const { id } = req.params;
+  const { projectId } = req.params;
   const { start, end } = req.body;
 
-  const video = await Video.findByPk(id);
+  const cur = await Video.findOne({
+    where: {
+      projectId,
+      isCurrent: true
+    }
+  });
+  if (!cur || !isOwner(req.user?.id, cur))
+    return res.status(403).json({ message: 'Unauthorized', video: null });
 
-  if (!video) return res.status(404).json({ message: 'Not found' });
-  if (!isOwner(req.user?.id, video)) return res.status(403).json({ message: "You are not authorised to perform this action" });
-  
-  const oldPath = video.path;
-  const ext = path.extname(oldPath);
-  const trimmedName = `${video.id}_trimmed${ext}`;
-  const trimmedPath = path.join(path.dirname(oldPath), trimmedName);
-
-  ffmpeg(oldPath)
+  await pruneFuture(cur);
+  const tmp = `${cur.path}.tmp_trim${path.extname(cur.path)}`;
+  ffmpeg(cur.path)
     .setStartTime(start)
     .setDuration(end - start)
-    .output(trimmedPath)
+    .output(tmp)
     .on('end', async () => {
-      video.path = trimmedPath;
-      video.status = 'trimmed';
-      await video.save();
-
-      // Delete old version
-      safeUnlink(oldPath);
-
-      res.json({ message: "Trimmed video saved", video });
+      const nextV = await createVersion(cur, tmp, 'trimmed');
+      res.json({ message: 'Trimmed', video: nextV });
     })
-    .on("error", (err) => res.status(500).json({ error: err.message }))
+    .on('error', e => res.status(500).json({ message: e.message, video: null }))
     .run();
 };
 
+// Add Subtitles
 exports.addSubtitles = async (req, res) => {
-  const { id } = req.params;
+  const { projectId } = req.params;
   const { subtitles } = req.body;
 
-  const video = await Video.findByPk(id);
-
-  if (!video) return res.status(404).json({ message: "Not found" });
-  if (!isOwner(req.user?.id, video))
-    return res.status(403).json({ message: "You are not authorised to perform this action" });
-
-  const oldPath = video.path;
-  const ext = path.extname(oldPath);
-  const subtitledName = `${video.id}_subtitled${ext}`;
-  const subtitlePath = path.join(path.dirname(oldPath), subtitledName);
-
-  const drawtext = subtitles.map(({ text, start, end }) => {
-    return `drawtext=text='${text}':enable='between(t,${start},${end})':x=(W-tw)/2:y=H-th-10:fontsize=24:fontcolor=white:box=1:boxborderw=5:boxcolor=black`;
+  const cur = await Video.findOne({
+    where: { projectId, isCurrent: true }
   });
+  if (!cur || !isOwner(req.user?.id, cur))
+    return res.status(403).json({ message: 'Unauthorized', video: null });
 
-  ffmpeg(oldPath)
-    .videoFilter(drawtext.join(","))
-    .output(subtitlePath)
-    .on("end", async () => {
-      video.path = subtitlePath;
-      video.status = "subtitle_added";
-      await video.save();
-
-      // Delete old version
-      safeUnlink(oldPath);
-
-      res.json({ message: "Subtitles added", video });
+  await pruneFuture(cur);
+  const tmp = `${cur.path}.tmp_sub${path.extname(cur.path)}`;
+  const filter = subtitles.map(({ text, start, end }) =>
+    `drawtext=text='${text}':enable='between(t,${start},${end})':x=(W-tw)/2:y=H-th-10:fontsize=24:fontcolor=white:box=1:boxborderw=5:boxcolor=black`
+  ).join(',');
+  ffmpeg(cur.path)
+    .videoFilter(filter)
+    .output(tmp)
+    .on('end', async () => {
+      const nextV = await createVersion(cur, tmp, 'subtitle_added');
+      res.json({ message: 'Subtitled', video: nextV });
     })
-    .on("error", (err) => res.status(500).json({ error: err.message }))
+    .on('error', e => res.status(500).json({ message: e.message, video: null }))
     .run();
 };
-exports.renderVideo = async (req, res) => {
-  const { id } = req.params;
 
-  try {
-    const job = await renderQueue.add({ videoId: id, userId: req.user?.id });
-    console.log(`Render job ${job.id} added to the queue for videoId: ${id}`);
-    res.json({ message: "Render job registered" });
-  } catch (error) {
-    console.error("Failed to add render job to the queue:", error);
-    res.status(500).json({ message: "Failed to start render", error: error.message });
-  }
+// Undo
+exports.undo = async (req, res) => {
+  const { projectId } = req.params;
+  const cur = await Video.findOne({
+    where: { projectId, isCurrent: true }
+  });
+
+  if (!isOwner(req.user?.id, cur))
+    return res.status(403).json({ message: 'Unauthorized', video: null });
+
+  if (!cur || !cur.previousVersionId)
+    return res.status(400).json({ message: 'Cannot undo', video: cur });
+
+  const prev = await Video.findByPk(cur.previousVersionId);
+  await cur.update({ isCurrent: false });
+  await prev.update({ isCurrent: true });
+  res.json({ message: 'Undone', video: prev });
 };
 
+// Redo
+exports.redo = async (req, res) => {
+  const { projectId } = req.params;
+  const cur = await Video.findOne({
+    where: { projectId, isCurrent: true }
+  });
+
+  if (!isOwner(req.user?.id, cur))
+    return res.status(403).json({ message: 'Unauthorized', video: null });
+
+  if (!cur || !cur.nextVersionId)
+    return res.status(400).json({ message: 'Cannot redo', video: cur });
+
+  const nxt = await Video.findByPk(cur.nextVersionId);
+  await cur.update({ isCurrent: false });
+  await nxt.update({ isCurrent: true });
+  res.json({ message: 'Redone', video: nxt });
+};
+
+// Refresh
+exports.refresh = async (req, res) => {
+  const { projectId } = req.params;
+  const cur = await Video.findOne({
+    where: { projectId, isCurrent: true }
+  });
+
+  if (!isOwner(req.user?.id, cur))
+    return res.status(403).json({ message: 'Unauthorized', video: null });
+
+  res.json({ message: 'Refreshed', video: cur });
+};
+
+// Render
+exports.renderVideo = async (req, res) => {
+  const { projectId } = req.params;
+  const job = await renderQueue.add({ projectId, userId: req.user?.id });
+  res.json({ message: 'Render queued', jobId: job.id, video: null });
+};
+
+// Download
 exports.downloadVideo = async (req, res) => {
-  const { id } = req.params;
-  const video = await Video.findByPk(id);
+  const { projectId } = req.params;
+  const cur = await Video.findOne({ where: { projectId, isCurrent: true } });
+  if (!cur) return res.status(404).json({ message: 'Not found', video: null });
+  if (cur.isPublic === false && cur.userId !== req.user?.id)
+    return res.status(403).json({ message: 'Unauthorized', video: null });
 
-  if (!video) return res.status(404).json({ message: 'Not found' });
-  if (video.isPublic === false && video.userId !== req.user?.id) {
-     return res.status(403).json({ message: "You are not authorised to perform this action" });
-  }
-
-  if (!video.finalPath) return res.status(404).json({ message: "Video not rendered yet." });
-
-  res.download(video.finalPath);
+  // streams the file
+  res.download(cur.path);
 };

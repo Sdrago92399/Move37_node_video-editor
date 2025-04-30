@@ -1,35 +1,36 @@
 # Video Processing Backend
 
-This repository contains a Node.js backend application for video processing as part of an assignment for Move37. It supports features like video upload, trimming, rendering, and caching using Redis which were required by the assignment as well as some additional fully optional features that I thought could be useful. The backend is built with tools like Sequelize for database management, Bull for job queues, and FFmpeg for video processing.
+This repository contains a Node.js backend application for video processing as part of an assignment for Move37. It supports features like video upload, trimming, rendering, undo/redo, versioning, and caching using Redis. The backend is built with tools like Sequelize for database management, Bull for job queues, and FFmpeg for video processing.
 
 ---
 
 ## Features
 
-### Required
+### Core
 
-- **Upload and manage videos**
-- **Trim video clips** and save them with new file paths
+- **Upload and manage videos** (per-project UUID, versioned)
+- **Trim video clips** and save as a new version
+- **Add subtitles** with FFmpeg filters, saved as a new version
 - **Render videos asynchronously** using a background job queue (Bull + Redis)
-- **Caching and queue management** with Redis
+- **Prune old versions** on render, keeping only the final output
 
 ### Optional (toggleable)
 
-- **User authentication** for secure and private video access
-- **Api Rate Limiting** to prevent server lag and malicious attacks.
-- **Acess Logging** a complete log map of ip-addresses accessing certain api routes.
-- **Role Middleware** - unused but can be integrated on the fly to restrict api route access.
+- **User authentication** for secure and private video access  
+- **Undo/Redo** edits via version chain (previous/next links)
+- **Refresh** to fetch the current version at any time
+- **API Rate Limiting** to prevent abuse  
+- **Access Logging** of IP‐addresses and route usage  
+- **Role Middleware** for route-level permissions  
 
 ---
 
 ## Prerequisites
 
-Ensure you have the following installed on your system:
-
-- **Node.js** (version 16+ recommended)  
-- **Redis** (local or cloud-hosted)  
+- **Node.js** (v16+ recommended)  
+- **Redis** (local or cloud)  
 - **PostgreSQL**  
-- **FFmpeg**
+- **FFmpeg**  
 
 ---
 
@@ -50,7 +51,7 @@ npm install
 
 ### 3. Environment Variables
 
-Create a `.env` file in the root directory and configure the following:
+Create a `.env` file in the root directory:
 
 ```env
 # Server
@@ -66,25 +67,28 @@ DB_PASSWORD=your_db_password
 # Redis
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
-REDIS_PASSWORD=your_redis_password   # omit if none
+REDIS_PASSWORD=your_redis_password  # omit if none
 
 # JWT
 JWT_SECRET=your_jwt_secret
+
+# FFmpeg probe location
+FFPROBE_LOCATION_ON_DISK=/usr/local/bin/ffprobe
 ```
+
 
 ### 4. Start Redis
 
-- **Locally**:
+```bash
+redis-server
+```
 
-  ```bash
-  redis-server
-  ```
+_or with Docker_
 
-- **With Docker**:
+```bash
+docker run --name redis-server -p 6379:6379 -d redis
+```
 
-  ```bash
-  docker run --name redis-server -p 6379:6379 -d redis
-  ```
 
 ### 5. FFmpeg Installation
 
@@ -110,19 +114,20 @@ Then locate ffprobe using appropriate command, in windows its:
 put that location in env file
 
 
-### 7. Run the Application
+
+### 6. Run the Application
 
 ```bash
 npm start
 ```
 
-> The server will run on `http://localhost:3000` by default.
+> The server listens on `http://localhost:3000`.
 
 ---
 
 ## API Endpoints
 
-### 1. **Upload Video**
+### 1. Upload Video
 
 ```http
 POST /api/videos/upload
@@ -130,29 +135,36 @@ Content-Type: multipart/form-data
 
 Form Data:
 - video: (File) Video to upload.
-- isPublic: (Optional) (String) "true" or "false", "true" by default. *Only works if logged in
+- isPublic: (String) (optional) "true" or "false" (default: true, login required for "false").
 ```
 
-### 2. **Trim Video**
+_Response_  
+```json
+{ "message": "Video uploaded", "video": { /* version 1 record */ } }
+```
+
+### 2. Trim Video
 
 ```http
-POST /api/videos/:id/trim
+POST /api/videos/:projectId/trim
 Content-Type: application/json
-authorization: (required for private videos) <token without "Bearer">
+authorization: <token without "Bearer"> (required for private video)
 
 Body:
-{
-  "start": 10,
-  "end": 20
-}
+{ "start": 10, "end": 20 }
 ```
 
-### 3. **Add Subtitles**
+_Response_  
+```json
+{ "message": "Trimmed", "video": { /* new version record */ } }
+```
+
+### 3. Add Subtitles
 
 ```http
-POST /api/videos/:id/subtitles
+POST /api/videos/:projectId/subtitles
 Content-Type: application/json
-authorization: (required for private videos) <token without "Bearer">
+authorization: <token without "Bearer"> (required for private video)
 
 Body:
 {
@@ -164,42 +176,92 @@ Body:
 }
 ```
 
-### 4. **Render Video**
+_Response_  
+```json
+{ "message": "Subtitled", "video": { /* new version record */ } }
+```
+
+### 4. Undo Last Action
 
 ```http
-POST /api/videos/:id/render
+POST /api/videos/:projectId/undo
 Content-Type: application/json
-authorization: (required for private videos) <token without "Bearer">
+authorization: <token without "Bearer"> (required for private video)
 ```
 
-> Triggers background rendering via Bull Queue.
+_Response_  
+```json
+{ "message": "Undone", "video": { /* previous version record */ } }
+```
 
-### 5. **Download Final Video**
+### 5. Redo Last Undone Action
 
 ```http
-GET /api/videos/:id/download
-authorization: (required for private videos) <token without "Bearer">
+POST /api/videos/:projectId/redo
+Content-Type: application/json
+authorization: <token without "Bearer"> (required for private video)
 ```
+
+_Response_  
+```json
+{ "message": "Redone", "video": { /* next version record */ } }
+```
+
+### 6. Refresh Current Version
+
+```http
+GET /api/videos/:projectId/refresh
+Content-Type: application/json
+authorization: <token without "Bearer"> (required for private video)
+```
+
+_Response_  
+```json
+{ "message": "Refreshed", "video": { /* current version record */ } }
+```
+
+### 7. Render Final Video
+
+```http
+POST /api/videos/:projectId/render
+Content-Type: application/json
+authorization: <token without "Bearer"> (required for private video)
+```
+
+_Response_  
+```json
+{ "message": "Render queued", "jobId": "<bull-job-id>" }
+```
+
+### 8. Download Final Video
+
+```http
+GET /api/videos/:projectId/download
+authorization: <token without "Bearer"> (required for private video)
+```
+
+> Streams the final rendered file.
 
 ---
 
 ## Debugging Tips
 
-- **Verify Redis**:  
+- **Redis**:  
   ```bash
   redis-cli ping
   ```
-- **Confirm FFmpeg**:  
+- **FFmpeg**:  
   ```bash
   ffmpeg -version
-  ```
 
 ---
 
 ## Contributing
 
-private for now
+Private for now.
+
+---
 
 ## License
 
-This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the **MIT License**. See [LICENSE](LICENSE).
